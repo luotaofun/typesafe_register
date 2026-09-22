@@ -24,8 +24,8 @@ import requests
 MAILTM_BASE_URL = "https://api.mail.tm"
 MAILTM_DOMAIN = None              # None = 每次启动自动获取首个可用域名
 _MAILTM_DOMAIN_CACHE = {"value": None}
-# 全局限流：mail.tm 8 QPS，256 并发下共享该信号量
-_MAILTM_QPS_SEMAPHORE = threading.Semaphore(6)
+# 全局限速：按固定间隔放行，低于官方 8 QPS 上限留余量（Semaphore 限并发不限速率会超限）
+MAILTM_QPS = 6
 
 CONSOLE_BASE_URL = "https://console.typesafe.ai"
 CONSOLE_DEPLOYMENT_ID = "cc6f6dca06537cc04123caaaf50ca5a76d506a92"   
@@ -35,11 +35,11 @@ PROXY_POOL = [
 ]                                
 
 API_KEY_NAME = "1111"
-ACCOUNT_COUNT = 512              
-CONCURRENCY = 256                  
-MAX_RETRIES_PER_ACCOUNT = 2       
-MAIL_POLL_INTERVAL_SECONDS = 0.05  
-MAIL_POLL_MAX_WAIT_SECONDS = 15  
+ACCOUNT_COUNT = 100
+CONCURRENCY = 64
+MAX_RETRIES_PER_ACCOUNT = 2
+MAIL_POLL_INTERVAL_SECONDS = 1.0
+MAIL_POLL_MAX_WAIT_SECONDS = 30
 REQUEST_TIMEOUT = 30
 TLS_ECDH_CURVE = "prime256v1"    
 OUTPUT_JSON_PATH = str(Path(__file__).resolve().parent / "accounts.json")
@@ -57,6 +57,42 @@ MAGIC_LINK_RE = re.compile(
 LOGIN_CACHE = {"action_id": None, "index": None, "blob": None}
 LOGIN_LOCK = threading.Lock()
 WRITE_LOCK = threading.Lock()
+
+
+class SignupDisabled(Exception):
+    """console 拒绝新开户（SELF_SERVE_DISABLED）。"""
+
+
+CIRCUIT = {"open": False, "reason": None}
+CIRCUIT_LOCK = threading.Lock()
+
+
+def open_circuit(reason):
+    with CIRCUIT_LOCK:
+        if not CIRCUIT["open"]:
+            CIRCUIT["open"] = True
+            CIRCUIT["reason"] = reason
+            log(f"熔断：注册通道关闭 — {reason}")
+
+
+class RateLimiter:
+    """线程安全间隔节流器：按固定间隔放行，平滑全局 QPS。"""
+
+    def __init__(self, qps):
+        self.interval = 1.0 / max(float(qps), 0.1)
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_at - now
+            self._next_at = max(now, self._next_at) + self.interval
+        if wait > 0:
+            time.sleep(wait)
+
+
+_MAILTM_RATE = RateLimiter(MAILTM_QPS)
 
 
 def log(msg):
@@ -117,15 +153,30 @@ def _mailtm_headers(token=None):
 
 
 def _mailtm_request(s, method, path, *, token=None, json_body=None):
-    """带全局限流的 mail.tm 请求。"""
-    with _MAILTM_QPS_SEMAPHORE:
+    """带全局限速与 429 指数退避的 mail.tm 请求。"""
+    last_err = None
+    for attempt in range(4):
+        _MAILTM_RATE.acquire()
         url = f"{MAILTM_BASE_URL}{path}"
-        if method == "GET":
-            r = s.get(url, headers=_mailtm_headers(token), timeout=REQUEST_TIMEOUT)
-        else:
-            r = s.post(url, headers=_mailtm_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
+        try:
+            if method == "GET":
+                r = s.get(url, headers=_mailtm_headers(token), timeout=REQUEST_TIMEOUT)
+            else:
+                r = s.post(url, headers=_mailtm_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            last_err = exc
+            time.sleep(1.5 ** attempt)
+            continue
+        if r.status_code == 429:
+            try:
+                retry_after = float(r.headers.get("Retry-After", ""))
+            except ValueError:
+                retry_after = 1.5 ** attempt
+            time.sleep(max(retry_after, 0.5))
+            continue
         r.raise_for_status()
         return r.json()
+    raise RuntimeError(f"mail.tm 限流重试耗尽: {path} last={last_err}")
 
 
 def _get_mailtm_domain(s):
@@ -217,7 +268,8 @@ def login_action(s, refresh=False):
         page = s.get(LOGIN_PAGE_URL, headers={"accept": "text/html,application/xhtml+xml"}, timeout=REQUEST_TIMEOUT).text
         dpl = re.search(r"dpl=([0-9a-f]{20,})", page)
         if dpl and dpl.group(1) != CONSOLE_DEPLOYMENT_ID:
-            log(f"注意：控制台部署变化 {CONSOLE_DEPLOYMENT_ID} -> {dpl.group(1)}")
+            log(f"控制台部署更新 {CONSOLE_DEPLOYMENT_ID} -> {dpl.group(1)}")
+            globals()["CONSOLE_DEPLOYMENT_ID"] = dpl.group(1)
         pos = page.find('type="email"')
         indexes = re.findall(r"\\?\$ACTION_(\d+):0", page[:pos])
         index = indexes[-1]
@@ -265,7 +317,11 @@ def auth_callback(s, token):
         },
         timeout=REQUEST_TIMEOUT,
     )
-    r.raise_for_status()
+    if r.status_code == 403 and "SELF_SERVE_DISABLED" in r.text:
+        open_circuit("SELF_SERVE_DISABLED：New signups are temporarily disabled")
+        raise SignupDisabled(r.text[:200])
+    if r.status_code >= 400:
+        raise RuntimeError(f"auth callback HTTP {r.status_code}: {r.text[:300]}")
     return r.json()
 
 
@@ -320,6 +376,13 @@ def save_account(record):
 
 
 def register_one(slot):
+    if CIRCUIT["open"]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return {
+            "status": "blocked", "slot": slot, "proxy": "direct",
+            "registered_at": now_iso, "finished_at": now_iso, "duration_seconds": 0.0,
+            "error": f"circuit_open: {CIRCUIT['reason']}",
+        }
     proxy = PROXIES.acquire()
     s = build_session(proxy)     
     mail = build_session()      
@@ -349,9 +412,20 @@ def register_one(slot):
         rec["api_key_created"] = key.get("created")
         rec["cookies"] = {c.name: c.value for c in s.cookies}
         rec["status"] = "ok"
+    except SignupDisabled as exc:
+        rec["status"] = "blocked"
+        rec["error"] = f"SignupDisabled: {exc}"
+        rec["cookies"] = {c.name: c.value for c in s.cookies}
     except Exception as exc:
         rec["status"] = "failed"
-        rec["error"] = f"{type(exc).__name__}: {exc}"
+        detail = f"{type(exc).__name__}: {exc}"
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                detail += f" body={resp.text[:200]}"
+            except Exception:
+                pass
+        rec["error"] = detail
         rec["cookies"] = {c.name: c.value for c in s.cookies}
     finally:
         rec["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -383,14 +457,33 @@ class Progress:
         )
 
 
+def probe():
+    """单账号全流程探测注册窗口。退出码：0=已恢复 2=仍关闭 1=其他失败。"""
+    rec = register_one(0)
+    if rec.get("email") or rec.get("status") == "ok":
+        try:
+            save_account(rec)
+        except Exception:
+            pass
+    summary = {k: rec.get(k) for k in ("status", "error", "email", "api_key", "duration_seconds")}
+    print("PROBE " + json.dumps(summary, ensure_ascii=False), flush=True)
+    if rec["status"] == "ok":
+        return 0
+    if rec["status"] == "blocked":
+        return 2
+    return 1
+
+
 def main():
+    if "--probe" in sys.argv[1:]:
+        return probe()
     log(f"开始注册 {ACCOUNT_COUNT} 个账号（并发 {CONCURRENCY}，代理池 {len(PROXIES.proxies)} 个，mail.tm 直连）-> {OUTPUT_JSON_PATH}")
     progress = Progress(ACCOUNT_COUNT)
 
     def run_slot(slot):
         for attempt in range(1, MAX_RETRIES_PER_ACCOUNT + 2):
             rec = register_one(slot)
-            if rec["status"] == "ok":
+            if rec["status"] in ("ok", "blocked"):
                 break
         rec["attempt"] = attempt
         try:
