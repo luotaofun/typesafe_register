@@ -1,0 +1,21 @@
+# 使用 venv 模块来创建虚拟环境并放到.venv 目录下 -m 是 module 的缩写告诉 Python 解释器将后面的模块名当作一个脚本来执行。
+# python -m venv .venv
+
+# 激活虚拟环境，使当前 shell 会话使用该虚拟环境中的 Python 解释器和包。
+# .venv/Scripts/activate
+# 退出虚拟环境
+# deactivate
+
+# 读取 requirements.txt 文件中的内容，并根据其中列出的包名和版本号自动安装所有依赖。
+# pip install -r requirements.txt
+
+# 删除虚拟环境
+# rm -r .venv/
+
+# 生成一个包含当前环境所有依赖的 requirements.txt 文件。
+# pip freeze > requirements.txt
+# 卸载requirements的依赖
+# pip uninstall -r requirements.txt
+
+# typesafe_register.py 依赖，除 requests 外其余均为标准库
+requests>=2.32.0

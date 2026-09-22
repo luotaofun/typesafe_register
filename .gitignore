@@ -1,0 +1,11 @@
+# python
+.venv/
+
+# Python 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 运行产物
+accounts.json

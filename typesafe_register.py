@@ -20,12 +20,12 @@ from pathlib import Path
 
 import requests
 
-TEMPMAIL_BASE_URL = ""
-TEMPMAIL_ADMIN_TOKEN = ""
-TEMPMAIL_MODE = "single"          
-TEMPMAIL_DOMAIN = ""              
-TEMPMAIL_DOMAIN_ID = None         
-TEMPMAIL_ADDRESS_PREFIX = ""      
+# mail.tm — 完全免费，无 API key，8 QPS/IP 限流
+MAILTM_BASE_URL = "https://api.mail.tm"
+MAILTM_DOMAIN = None              # None = 每次启动自动获取首个可用域名
+_MAILTM_DOMAIN_CACHE = {"value": None}
+# 全局限流：mail.tm 8 QPS，256 并发下共享该信号量
+_MAILTM_QPS_SEMAPHORE = threading.Semaphore(6)
 
 CONSOLE_BASE_URL = "https://console.typesafe.ai"
 CONSOLE_DEPLOYMENT_ID = "cc6f6dca06537cc04123caaaf50ca5a76d506a92"   
@@ -109,48 +109,97 @@ def build_session(proxy=None):
     return s
 
 
-def tm_headers():
-    return {"Authorization": f"Bearer {TEMPMAIL_ADMIN_TOKEN}", "Content-Type": "application/json", "accept": "*/*"}
+def _mailtm_headers(token=None):
+    h = {"Content-Type": "application/json", "accept": "application/json"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+def _mailtm_request(s, method, path, *, token=None, json_body=None):
+    """带全局限流的 mail.tm 请求。"""
+    with _MAILTM_QPS_SEMAPHORE:
+        url = f"{MAILTM_BASE_URL}{path}"
+        if method == "GET":
+            r = s.get(url, headers=_mailtm_headers(token), timeout=REQUEST_TIMEOUT)
+        else:
+            r = s.post(url, headers=_mailtm_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+
+
+def _get_mailtm_domain(s):
+    """进程内缓存域名，只请求一次。"""
+    if _MAILTM_DOMAIN_CACHE["value"]:
+        return _MAILTM_DOMAIN_CACHE["value"]
+    if MAILTM_DOMAIN:
+        _MAILTM_DOMAIN_CACHE["value"] = MAILTM_DOMAIN
+        return MAILTM_DOMAIN
+    data = _mailtm_request(s, "GET", "/domains")
+    if isinstance(data, list):
+        members = data
+    else:
+        members = data.get("hydra:member") or data.get("member") or []
+    members = [m for m in members if m.get("isActive", True)]
+    if not members:
+        raise RuntimeError("mail.tm 未返回可用域名")
+    domain = members[0]["domain"]
+    _MAILTM_DOMAIN_CACHE["value"] = domain
+    return domain
 
 
 def create_mailbox(s):
-    payload = {"mode": TEMPMAIL_MODE}
-    if TEMPMAIL_DOMAIN:
-        payload["domain"] = TEMPMAIL_DOMAIN
-    if TEMPMAIL_DOMAIN_ID is not None:
-        payload["domain_id"] = TEMPMAIL_DOMAIN_ID
-    if TEMPMAIL_ADDRESS_PREFIX:
-        suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-        payload["address"] = TEMPMAIL_ADDRESS_PREFIX + suffix
-    r = s.post(f"{TEMPMAIL_BASE_URL}/api/mailboxes", headers=tm_headers(), json=payload, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()["mailbox"]
+    """创建 mail.tm 账号并获取 Bearer token。"""
+    domain = _get_mailtm_domain(s)
+    local = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    address = f"{local}@{domain}"
+    password = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    account = _mailtm_request(s, "POST", "/accounts", json_body={"address": address, "password": password})
+    token_data = _mailtm_request(s, "POST", "/token", json_body={"address": address, "password": password})
+    return {
+        "id": account["id"],
+        "full_address": address,
+        "token": token_data["token"],
+        "domain": domain,
+    }
 
 
-def tm_get(s, path):
-    r = s.get(f"{TEMPMAIL_BASE_URL}{path}", headers=tm_headers(), timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-def wait_magic_link(s, mailbox_id, after_iso):
+def wait_magic_link(s, mailbox, after_iso):
+    """
+    轮询 mail.tm 收件箱，提取 typesafe magic link。
+    mailbox: create_mailbox 返回的 dict（含 id/full_address/token）
+    """
+    bearer = mailbox["token"]
     deadline = time.time() + MAIL_POLL_MAX_WAIT_SECONDS
     while True:
-        mails = sorted(tm_get(s, f"/api/mailboxes/{mailbox_id}/emails")["data"], key=lambda m: m["received_at"], reverse=True)
-        for item in mails:
-            if after_iso and item["received_at"].replace("Z", "+00:00") <= after_iso:
+        data = _mailtm_request(s, "GET", "/messages", token=bearer)
+        items = data if isinstance(data, list) else (data.get("hydra:member") or data.get("member") or [])
+        for item in items:
+            created = item.get("createdAt") or ""
+            if after_iso and created.replace("Z", "+00:00") <= after_iso:
                 continue
-            tag = (item.get("sender", "") + item.get("subject", "")).lower()
+            frm = item.get("from") or {}
+            tag = ((frm.get("address") or "") + (item.get("subject") or "")).lower()
             if "typesafe" not in tag:
                 continue
-            mail = tm_get(s, f"/api/mailboxes/{mailbox_id}/emails/{item['id']}")["email"]
-            hay = "\n".join([mail.get("body_text") or "", mail.get("body_html") or "", mail.get("raw_message") or ""])
+            detail = _mailtm_request(s, "GET", f"/messages/{item['id']}", token=bearer)
+            text = detail.get("text") or ""
+            html_parts = detail.get("html") or []
+            if isinstance(html_parts, list):
+                html_joined = "\n".join(html_parts)
+            else:
+                html_joined = str(html_parts)
+            hay = "\n".join([text, html_joined])
             m = MAGIC_LINK_RE.search(hay)
             if m:
                 return {
-                    "email_id": mail["id"], "sender": mail.get("sender"), "subject": mail.get("subject"),
-                    "received_at": mail.get("received_at"), "public_token": m.group("public_token"),
-                    "token": m.group("token"), "magic_link": m.group(0),
+                    "email_id": detail.get("id"),
+                    "sender": (frm.get("address") or ""),
+                    "subject": detail.get("subject"),
+                    "received_at": detail.get("createdAt"),
+                    "public_token": m.group("public_token"),
+                    "token": m.group("token"),
+                    "magic_link": m.group(0),
                 }
         if time.time() >= deadline:
             raise TimeoutError(f"等待 magic link 邮件超时（{MAIL_POLL_MAX_WAIT_SECONDS}s）")
@@ -285,7 +334,7 @@ def register_one(slot):
         rec["email"] = mailbox["full_address"]
         sent_at = datetime.now(timezone.utc).isoformat()
         rec["send_magic_link"] = send_magic_link(s, rec["email"])
-        link = wait_magic_link(mail, mailbox["id"], sent_at)
+        link = wait_magic_link(mail, mailbox, sent_at)
         rec["magic_link"] = link
         cb = auth_callback(s, link["token"])
         rec["callback"] = cb
@@ -335,7 +384,7 @@ class Progress:
 
 
 def main():
-    log(f"开始注册 {ACCOUNT_COUNT} 个账号（并发 {CONCURRENCY}，代理池 {len(PROXIES.proxies)} 个，临时邮箱直连）-> {OUTPUT_JSON_PATH}")
+    log(f"开始注册 {ACCOUNT_COUNT} 个账号（并发 {CONCURRENCY}，代理池 {len(PROXIES.proxies)} 个，mail.tm 直连）-> {OUTPUT_JSON_PATH}")
     progress = Progress(ACCOUNT_COUNT)
 
     def run_slot(slot):
